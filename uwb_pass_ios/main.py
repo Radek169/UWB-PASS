@@ -344,13 +344,11 @@ class App(tk.Tk):
         for c,t,w in [('type','Typ',95),('title','Nazwa',210),('login','Login',170),('url','URL',260),('perm','Dostęp',100)]:
             self.tree.heading(c,text=t); self.tree.column(c,width=w,anchor='w')
         self.tree.pack(fill='both',expand=True); self.tree.bind('<<TreeviewSelect>>',lambda e:self.show_selected())
+        self.tree.bind('<Double-1>', lambda e:self.open_edit())
         side=ttk.Frame(content, style='Card.TFrame', padding=16); side.grid(row=0,column=1,sticky='nsew')
         ttk.Label(side,text='Szybkie akcje',style='Card.TLabel',font=('Arial', 16, 'bold')).pack(anchor='w',pady=(0,12))
         for txt,cmd,sty in [('＋ Dodaj login',lambda:self.edit(LOGIN),'Accent.TButton'),('＋ Dodaj notatkę',lambda:self.edit(NOTE),'TButton'),('Podgląd / edycja',self.open_edit,'TButton'),('Udostępnij',self.share,'TButton'),('Cofnij udostępnienie',self.revoke,'TButton'),('Usuń wpis',self.delete,'Danger.TButton')]:
             self.make_button(side,txt,cmd,sty).pack(fill='x',pady=4)
-        ttk.Label(side,text='Udostępnienia właściciela',style='Card.TLabel',font=('Arial', 13, 'bold')).pack(anchor='w',pady=(16,6))
-        self.access_box=tk.Text(side,width=42,height=7,bg='#f9fafb',fg=self.TEXT,relief='flat',bd=0,padx=10,pady=8,wrap='word',font=('Consolas',9))
-        self.access_box.pack(fill='x')
         ttk.Label(side,text='Szczegóły wpisu',style='Card.TLabel',font=('Arial', 13, 'bold')).pack(anchor='w',pady=(18,8))
         self.details=tk.Text(side,width=42,height=20,bg='#f9fafb',fg=self.TEXT,insertbackground=self.TEXT,relief='flat',bd=0,padx=12,pady=12,wrap='word',font=('Consolas',10))
         self.details.pack(fill='both',expand=True)
