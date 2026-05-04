@@ -91,6 +91,18 @@ class Store:
                          FROM share_grants g JOIN vault_items i ON i.id=g.item_id
                          JOIN users u ON u.id=g.recipient_id
                          WHERE g.owner_id=? ORDER BY g.created_at DESC''',(uid,)).fetchall()
+    def item_share_info(self, uid, item_id):
+        it = self.item(item_id)
+        if not it or not self.can_read(uid, item_id):
+            return None, []
+        owner_id = self.owner_id(it)
+        owner = self.user_by_id(owner_id)
+        shares = self.q('''SELECT g.*, u.username AS recipient
+                           FROM share_grants g
+                           JOIN users u ON u.id = g.recipient_id
+                           WHERE g.item_id = ?
+                           ORDER BY u.username''', (item_id,)).fetchall()
+        return owner['username'] if owner else str(owner_id), shares
     def audit_all(self, uid):
         return self.q('''SELECT a.*, u.username FROM audit_events a LEFT JOIN users u ON u.id=a.user_id
                          WHERE a.user_id=? OR a.details LIKE ? ORDER BY a.created_at DESC LIMIT 250''',(uid, f'%owner:{uid}%')).fetchall()
@@ -377,7 +389,18 @@ class App(tk.Tk):
                 data=decrypt_secret(self.key,it['encrypted_data'])
                 for k,v in data.items(): self.details.insert('end',f'{k}: {v}\n')
             except Exception: self.details.insert('end','Sekret zaszyfrowany cudzym kluczem albo brak dostępu.\n')
-        else: self.details.insert('end','Sejf LOCKED — widoczne tylko metadane.\n')
+        else:
+            self.details.insert('end','Sejf LOCKED — widoczne tylko metadane.\n')
+
+        owner, shares = self.s.item_share_info(self.user['id'], iid)
+        self.details.insert('end','\nUdostępnienia właściciela:\n')
+        if owner:
+            self.details.insert('end',f'Właściciel: {owner}\n')
+        if shares:
+            for g in shares:
+                self.details.insert('end',f"- {g['recipient']} [{g['permission']}] od {iso(g['created_at'])}\n")
+        else:
+            self.details.insert('end','Brak aktywnych udostępnień dla tego wpisu.\n')
     def unlock(self):
         p=simpledialog.askstring('Odblokuj sejf','Podaj hasło główne:',show='*')
         if p:
