@@ -1,4 +1,4 @@
-import base64, csv, hashlib, json, secrets, sqlite3, string, time
+import base64, csv, hashlib, json, re, secrets, sqlite3, string, time
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -80,6 +80,19 @@ class Store:
             id INTEGER PRIMARY KEY, user_id INTEGER, started_at INTEGER, last_activity INTEGER)''')
     def audit(self, user_id, typ, details=''):
         self.q('INSERT INTO audit_events(user_id,event_type,details,created_at) VALUES(?,?,?,?)',(user_id,typ,details,now()))
+    def uname(self, uid):
+        u = self.user_by_id(uid)
+        return u['username'] if u else f'ID {uid}'
+    def safe_text(self, value):
+        if value is None: return ''
+        return str(value)
+    def fmt_change(self, label, old, new, hide=False):
+        old = self.safe_text(old); new = self.safe_text(new)
+        if old == new:
+            return None
+        if hide:
+            return f'- {label}: zmieniono (wartość ukryta w audycie)'
+        return f'- {label}: „{old}” → „{new}”'
     def user(self, username):
         return self.q('SELECT * FROM users WHERE username=?',(username,)).fetchone()
     def user_by_id(self, uid):
@@ -105,7 +118,9 @@ class Store:
         return owner['username'] if owner else str(owner_id), shares
     def audit_all(self, uid):
         return self.q('''SELECT a.*, u.username FROM audit_events a LEFT JOIN users u ON u.id=a.user_id
-                         WHERE a.user_id=? OR a.details LIKE ? ORDER BY a.created_at DESC LIMIT 250''',(uid, f'%owner:{uid}%')).fetchall()
+                         WHERE a.user_id=? OR a.details LIKE ? OR a.details LIKE ? OR a.details LIKE ?
+                         ORDER BY a.created_at DESC LIMIT 250''',
+                      (uid, f'%owner:{uid}%', f'%recipient:{uid}%', f'%actor:{uid}%')).fetchall()
     def register(self, username, password):
         if not username or len(password) < 8: raise ValueError('Login wymagany, hasło min. 8 znaków.')
         ps, ph = hash_password(password); ks = b64(secrets.token_bytes(16))
@@ -160,19 +175,43 @@ class Store:
         fp=hashlib.sha256(pwd.encode()).hexdigest() if pwd else None
         self.q('''INSERT INTO vault_items(vault_id,type,title,url,username,encrypted_data,password_fingerprint,created_at,updated_at)
                   VALUES(?,?,?,?,?,?,?,?,?)''',(vault_id,typ,title,public.get('url'),public.get('username'),enc_json(APP_DATA_KEY,secret),fp,now(),now()))
-        self.audit(uid,'ITEM_CREATE',f'{title} | owner:{uid}')
+        self.audit(uid,'Utworzono wpis',f'Właściciel: {self.uname(uid)}. Utworzono wpis „{title}”. Typ: {typ}. Login: {public.get('username') or ''}. URL: {public.get('url') or ''}. owner:{uid}')
     def update_item(self, uid, key, item_id, title, public, secret):
         if not self.can_edit(uid,item_id): raise ValueError('Brak uprawnień do edycji.')
         if not self.is_unlocked(uid): raise ValueError('Sejf jest zablokowany.')
+        old_it = self.item(item_id)
+        old_secret = {}
+        try:
+            old_secret = decrypt_secret(key, old_it['encrypted_data'])
+        except Exception:
+            try: old_secret = dec_json(APP_DATA_KEY, old_it['encrypted_data'])
+            except Exception: old_secret = {}
         pwd=secret.get('password',''); fp=hashlib.sha256(pwd.encode()).hexdigest() if pwd else None
         self.q('UPDATE vault_items SET title=?,url=?,username=?,encrypted_data=?,password_fingerprint=?,updated_at=? WHERE id=?',
                (title,public.get('url'),public.get('username'),enc_json(APP_DATA_KEY,secret),fp,now(),item_id))
-        owner=self.owner_id(self.item(item_id)); self.audit(uid,'ITEM_UPDATE',f'{title} | item:{item_id} | owner:{owner}')
+        owner=self.owner_id(old_it)
+        changes=[]
+        for label, old, newv in [
+            ('Nazwa wpisu', old_it['title'], title),
+            ('URL', old_it['url'] or '', public.get('url') or ''),
+            ('Login', old_it['username'] or '', public.get('username') or ''),
+        ]:
+            c=self.fmt_change(label, old, newv)
+            if c: changes.append(c)
+        for k,v in secret.items():
+            label={'password':'Hasło','note':'Notatka','content':'Treść notatki'}.get(k,k)
+            c=self.fmt_change(label, old_secret.get(k,''), v, hide=(k=='password'))
+            if c: changes.append(c)
+        if not changes:
+            changes.append('- Zapisano wpis bez zmiany wartości pól.')
+        actor=self.uname(uid); owner_name=self.uname(owner)
+        details=f'Aktor: {actor}. Wpis „{old_it["title"]}” (ID {item_id}), właściciel: {owner_name}.\n' + '\n'.join(changes) + f'\nitem:{item_id} owner:{owner} actor:{uid}'
+        self.audit(uid,'Zmieniono wpis',details)
     def delete_item(self, uid, item_id):
         it=self.item(item_id)
         if not it or self.owner_id(it)!=uid: raise ValueError('Tylko właściciel może usunąć wpis.')
         self.q('DELETE FROM share_grants WHERE item_id=?',(item_id,)); self.q('DELETE FROM vault_items WHERE id=?',(item_id,))
-        self.audit(uid,'ITEM_DELETE',it['title'])
+        self.audit(uid,'Usunięto wpis',f'Właściciel: {self.uname(uid)}. Usunięto wpis „{it["title"]}” (ID {item_id}). owner:{uid} item:{item_id}')
     def item(self, iid): return self.q('SELECT * FROM vault_items WHERE id=?',(iid,)).fetchone()
     def owner_id(self, item): return self.q('SELECT user_id FROM vaults WHERE id=?',(item['vault_id'],)).fetchone()[0]
     def can_read(self, uid, item_id):
@@ -197,11 +236,11 @@ class Store:
         if r['id']==uid: raise ValueError('Nie można udostępnić samemu sobie.')
         self.q('''INSERT INTO share_grants(item_id,owner_id,recipient_id,permission,created_at) VALUES(?,?,?,?,?)
                   ON CONFLICT(item_id,recipient_id) DO UPDATE SET permission=excluded.permission''',(item_id,uid,r['id'],perm,now()))
-        self.audit(uid,'SHARE_GRANT',f'{it["title"]} -> {recipient} ({perm}) | item:{item_id} | owner:{uid}')
+        self.audit(uid,'Zmieniono udostępnienie',f'Właściciel: {self.uname(uid)}. Wpis „{it["title"]}” (ID {item_id}) udostępniono użytkownikowi {recipient}. Uprawnienie: {perm}. owner:{uid} recipient:{r["id"]} item:{item_id}')
     def revoke(self, uid, item_id, recipient):
         r=self.user(recipient); it=self.item(item_id)
         if r and it and self.owner_id(it)==uid:
-            self.q('DELETE FROM share_grants WHERE item_id=? AND recipient_id=?',(item_id,r['id'])); self.audit(uid,'SHARE_REVOKE',f'{it["title"]} -> {recipient}')
+            self.q('DELETE FROM share_grants WHERE item_id=? AND recipient_id=?',(item_id,r['id'])); self.audit(uid,'Cofnięto udostępnienie',f'Właściciel: {self.uname(uid)}. Cofnięto dostęp użytkownikowi {recipient} do wpisu „{it["title"]}” (ID {item_id}). owner:{uid} recipient:{r["id"]} item:{item_id}')
     def audit_list(self, uid): return self.q('SELECT * FROM audit_events WHERE user_id=? ORDER BY created_at DESC LIMIT 200',(uid,)).fetchall()
     def export(self, uid, key, with_secrets=False):
         if with_secrets and not self.is_unlocked(uid): raise ValueError('Eksport sekretów wymaga odblokowanego sejfu.')
@@ -479,7 +518,13 @@ class App(tk.Tk):
         score=max(0,100-dup*20-short*10)
         messagebox.showinfo('Password Health',f'Powtórzone hasła: {dup}\nHasła krótsze niż 12 znaków: {short}\nOcena sejfu: {score}/100\nAnaliza używa fingerprintów i długości, bez zapisywania haseł jawnie w bazie.')
     def audit(self):
-        text='\n'.join(f"{iso(r['created_at'])} | {r['username'] or 'system'} | {r['event_type']} | {r['details']}" for r in self.s.audit_all(self.user['id']))
+        labels={'ITEM_UPDATE':'Zmieniono wpis','ITEM_CREATE':'Utworzono wpis','ITEM_DELETE':'Usunięto wpis','SHARE_GRANT':'Zmieniono udostępnienie','SHARE_REVOKE':'Cofnięto udostępnienie','LOGIN':'Logowanie','LOGOUT':'Wylogowanie','REGISTER':'Rejestracja','VAULT_UNLOCK':'Odblokowanie sejfu','VAULT_LOCK':'Zablokowanie sejfu','AUTO_LOCK':'Automatyczna blokada','EXPORT':'Eksport'}
+        lines=[]
+        for r in self.s.audit_all(self.user['id']):
+            typ=labels.get(r['event_type'], r['event_type'])
+            details=re.sub(r'\s*(item|owner|recipient|actor):\d+', '', r['details'] or '').strip()
+            lines.append(f"{iso(r['created_at'])} | {r['username'] or 'system'} | {typ}\n{details}\n")
+        text='\n'.join(lines)
         win=tk.Toplevel(self); win.title('Audyt zdarzeń'); win.configure(bg=self.BG); t=tk.Text(win,width=110,height=34,bg='#f9fafb',fg=self.TEXT,insertbackground=self.TEXT,relief='flat',padx=14,pady=14,font=('Consolas',10)); t.pack(fill='both',expand=True,padx=12,pady=12); t.insert('end',text)
     def export(self):
         with_sec=messagebox.askyesno('Eksport','Eksportować także sekrety? Wymaga odblokowanego sejfu.')
