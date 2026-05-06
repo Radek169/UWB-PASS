@@ -321,6 +321,71 @@ class App(tk.Tk):
         btn = ttk.Button(box, text='👁', width=3, command=toggle)
         btn.pack(side='left', padx=(6,0))
         return box, entry
+
+    def ask_modal_text(self, title, prompt, initialvalue='', show=None):
+        """Własne stabilne okno dialogowe: nie znika za główne okno i łapie fokus."""
+        result = {'value': None}
+        win = tk.Toplevel(self)
+        # Ukryj dialog na czas budowania i centrowania.
+        # Bez tego Windows/Tk potrafi najpierw pokazać go w lewym górnym rogu.
+        win.withdraw()
+        win.title(title)
+        win.configure(bg=self.BG)
+        win.transient(self)
+        win.resizable(False, False)
+        win.attributes('-topmost', True)
+
+        frm = ttk.Frame(win, style='Card.TFrame', padding=16)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text=prompt, style='Card.TLabel', wraplength=360).pack(anchor='w', pady=(0, 8))
+        entry = ttk.Entry(frm, width=36, show=show or '')
+        entry.pack(fill='x', ipady=4)
+        entry.insert(0, initialvalue or '')
+        entry.select_range(0, 'end')
+
+        btns = ttk.Frame(frm, style='Card.TFrame')
+        btns.pack(fill='x', pady=(14, 0))
+
+        def ok():
+            result['value'] = entry.get()
+            win.destroy()
+
+        def cancel():
+            result['value'] = None
+            win.destroy()
+
+        ttk.Button(btns, text='OK', command=ok, style='Accent.TButton').pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(btns, text='Anuluj', command=cancel).pack(side='left', fill='x', expand=True, padx=(6, 0))
+        win.bind('<Return>', lambda e: ok())
+        win.bind('<Escape>', lambda e: cancel())
+
+        # Ustaw okno dialogowe dokładnie na środku głównego okna.
+        # update_idletasks() liczy prawdziwy rozmiar okna przed ustawieniem pozycji,
+        # inaczej Windows/Tk potrafi na chwilę pokazać dialog w lewym górnym rogu ekranu.
+        win.update_idletasks()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = max(self.winfo_width(), 1)
+        parent_h = max(self.winfo_height(), 1)
+        win_w = win.winfo_width()
+        win_h = win.winfo_height()
+        x = parent_x + (parent_w - win_w) // 2
+        y = parent_y + (parent_h - win_h) // 2
+
+        # Nie pozwól, aby dialog wyszedł poza ekran.
+        x = max(0, min(x, win.winfo_screenwidth() - win_w))
+        y = max(0, min(y, win.winfo_screenheight() - win_h))
+        win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+
+        # Dopiero teraz pokaż okno, już w poprawnym miejscu.
+        win.deiconify()
+        win.lift(self)
+        win.focus_force()
+        entry.focus_force()
+        win.grab_set()
+        self.wait_window(win)
+        return result['value']
+
     def login_screen(self):
         self.clear()
         root=ttk.Frame(self, style='TFrame', padding=28); root.pack(fill='both', expand=True)
@@ -340,7 +405,7 @@ class App(tk.Tk):
         def set_user(name):
             u.delete(0,'end'); u.insert(0,name); p.focus_set()
         def delete_account(username):
-            pwd = simpledialog.askstring('Usuń konto', f'Podaj hasło konta „{username}”, które chcesz usunąć:', show='*')
+            pwd = self.ask_modal_text('Usuń konto', f'Podaj hasło konta „{username}”, które chcesz usunąć:', show='*')
             if not pwd:
                 return
             if not messagebox.askyesno('Ostateczne potwierdzenie', f'Czy na pewno chcesz usunąć konto „{username}”?\n\nTa operacja usunie też jego sejf i nie można jej cofnąć.'):
@@ -441,7 +506,7 @@ class App(tk.Tk):
         else:
             self.details.insert('end','Brak aktywnych udostępnień dla tego wpisu.\n')
     def unlock(self):
-        p=simpledialog.askstring('Odblokuj sejf','Podaj hasło główne:',show='*')
+        p=self.ask_modal_text('Odblokuj sejf','Podaj hasło główne:',show='*')
         if p:
             try: self.s.unlock(self.user['id'],p); self.key=derive_key(p,self.user['kdf_salt']); self.refresh(); self.show_selected()
             except Exception as e: messagebox.showerror('Błąd',str(e))
@@ -487,11 +552,13 @@ class App(tk.Tk):
     def share(self):
         iid=self.current_id();
         if not iid: return
-        rec=simpledialog.askstring('Udostępnij','Login odbiorcy:'); perm=simpledialog.askstring('Uprawnienie','READ albo UPDATE:',initialvalue='READ')
+        rec=self.ask_modal_text('Udostępnij','Login odbiorcy:')
+        if not rec: return
+        perm=self.ask_modal_text('Uprawnienie','READ albo UPDATE:',initialvalue='READ')
         try: self.s.share(self.user['id'],iid,rec,(perm or READ).upper()); self.refresh()
         except Exception as e: messagebox.showerror('Błąd',str(e))
     def revoke(self):
-        iid=self.current_id(); rec=simpledialog.askstring('Cofnij','Login odbiorcy:')
+        iid=self.current_id(); rec=self.ask_modal_text('Cofnij','Login odbiorcy:')
         if iid and rec: self.s.revoke(self.user['id'],iid,rec); self.refresh()
     def generator(self):
         win=tk.Toplevel(self); win.title('Generator haseł'); win.configure(bg=self.BG); frm=ttk.Frame(win,style='Card.TFrame',padding=20); frm.pack(fill='both',expand=True,padx=12,pady=12)
@@ -529,7 +596,7 @@ class App(tk.Tk):
     def export(self):
         with_sec=messagebox.askyesno('Eksport','Eksportować także sekrety? Wymaga odblokowanego sejfu.')
         if with_sec:
-            p=simpledialog.askstring('Potwierdzenie','Ponownie podaj hasło główne:',show='*')
+            p=self.ask_modal_text('Potwierdzenie','Ponownie podaj hasło główne:',show='*')
             if not p or not verify_password(p,self.user['password_salt'],self.user['password_hash']): return messagebox.showerror('Błąd','Niepoprawne hasło.')
         try: rows=self.s.export(self.user['id'],self.key,with_sec)
         except Exception as e: return messagebox.showerror('Błąd',str(e))
