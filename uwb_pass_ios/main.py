@@ -1,4 +1,4 @@
-import base64, csv, hashlib, json, secrets, sqlite3, string, time
+import base64, csv, hashlib, json, re, secrets, sqlite3, string, time
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -80,6 +80,19 @@ class Store:
             id INTEGER PRIMARY KEY, user_id INTEGER, started_at INTEGER, last_activity INTEGER)''')
     def audit(self, user_id, typ, details=''):
         self.q('INSERT INTO audit_events(user_id,event_type,details,created_at) VALUES(?,?,?,?)',(user_id,typ,details,now()))
+    def uname(self, uid):
+        u = self.user_by_id(uid)
+        return u['username'] if u else f'ID {uid}'
+    def safe_text(self, value):
+        if value is None: return ''
+        return str(value)
+    def fmt_change(self, label, old, new, hide=False):
+        old = self.safe_text(old); new = self.safe_text(new)
+        if old == new:
+            return None
+        if hide:
+            return f'- {label}: zmieniono (wartość ukryta w audycie)'
+        return f'- {label}: „{old}” → „{new}”'
     def user(self, username):
         return self.q('SELECT * FROM users WHERE username=?',(username,)).fetchone()
     def user_by_id(self, uid):
@@ -91,9 +104,23 @@ class Store:
                          FROM share_grants g JOIN vault_items i ON i.id=g.item_id
                          JOIN users u ON u.id=g.recipient_id
                          WHERE g.owner_id=? ORDER BY g.created_at DESC''',(uid,)).fetchall()
+    def item_share_info(self, uid, item_id):
+        it = self.item(item_id)
+        if not it or not self.can_read(uid, item_id):
+            return None, []
+        owner_id = self.owner_id(it)
+        owner = self.user_by_id(owner_id)
+        shares = self.q('''SELECT g.*, u.username AS recipient
+                           FROM share_grants g
+                           JOIN users u ON u.id = g.recipient_id
+                           WHERE g.item_id = ?
+                           ORDER BY u.username''', (item_id,)).fetchall()
+        return owner['username'] if owner else str(owner_id), shares
     def audit_all(self, uid):
         return self.q('''SELECT a.*, u.username FROM audit_events a LEFT JOIN users u ON u.id=a.user_id
-                         WHERE a.user_id=? OR a.details LIKE ? ORDER BY a.created_at DESC LIMIT 250''',(uid, f'%owner:{uid}%')).fetchall()
+                         WHERE a.user_id=? OR a.details LIKE ? OR a.details LIKE ? OR a.details LIKE ?
+                         ORDER BY a.created_at DESC LIMIT 250''',
+                      (uid, f'%owner:{uid}%', f'%recipient:{uid}%', f'%actor:{uid}%')).fetchall()
     def register(self, username, password):
         if not username or len(password) < 8: raise ValueError('Login wymagany, hasło min. 8 znaków.')
         ps, ph = hash_password(password); ks = b64(secrets.token_bytes(16))
@@ -101,6 +128,26 @@ class Store:
         uid = cur.lastrowid
         self.q('INSERT INTO vaults(user_id,state,locked_at) VALUES(?,?,?)',(uid,'LOCKED',now()))
         self.audit(uid,'REGISTER','Utworzono konto i sejf')
+    def delete_user(self, username, password):
+        u = self.user(username)
+        if not u:
+            raise ValueError('Konto nie istnieje.')
+        if not verify_password(password, u['password_salt'], u['password_hash']):
+            self.audit(u['id'], 'ACCOUNT_DELETE_FAILED', 'Błędne hasło przy próbie usunięcia konta')
+            raise ValueError('Niepoprawne hasło do tego konta.')
+        uid = u['id']
+        vault = self.vault(uid)
+        if vault:
+            item_ids = [r['id'] for r in self.q('SELECT id FROM vault_items WHERE vault_id=?', (vault['id'],)).fetchall()]
+            for item_id in item_ids:
+                self.q('DELETE FROM share_grants WHERE item_id=?', (item_id,))
+            self.q('DELETE FROM vault_items WHERE vault_id=?', (vault['id'],))
+            self.q('DELETE FROM vaults WHERE user_id=?', (uid,))
+        self.q('DELETE FROM share_grants WHERE owner_id=? OR recipient_id=?', (uid, uid))
+        self.q('DELETE FROM sessions WHERE user_id=?', (uid,))
+        self.q('DELETE FROM audit_events WHERE user_id=?', (uid,))
+        self.q('DELETE FROM users WHERE id=?', (uid,))
+
     def login(self, username, password):
         u = self.user(username)
         if not u or not verify_password(password, u['password_salt'], u['password_hash']):
@@ -128,19 +175,43 @@ class Store:
         fp=hashlib.sha256(pwd.encode()).hexdigest() if pwd else None
         self.q('''INSERT INTO vault_items(vault_id,type,title,url,username,encrypted_data,password_fingerprint,created_at,updated_at)
                   VALUES(?,?,?,?,?,?,?,?,?)''',(vault_id,typ,title,public.get('url'),public.get('username'),enc_json(APP_DATA_KEY,secret),fp,now(),now()))
-        self.audit(uid,'ITEM_CREATE',f'{title} | owner:{uid}')
+        self.audit(uid,'Utworzono wpis',f'Właściciel: {self.uname(uid)}. Utworzono wpis „{title}”. Typ: {typ}. Login: {public.get('username') or ''}. URL: {public.get('url') or ''}. owner:{uid}')
     def update_item(self, uid, key, item_id, title, public, secret):
         if not self.can_edit(uid,item_id): raise ValueError('Brak uprawnień do edycji.')
         if not self.is_unlocked(uid): raise ValueError('Sejf jest zablokowany.')
+        old_it = self.item(item_id)
+        old_secret = {}
+        try:
+            old_secret = decrypt_secret(key, old_it['encrypted_data'])
+        except Exception:
+            try: old_secret = dec_json(APP_DATA_KEY, old_it['encrypted_data'])
+            except Exception: old_secret = {}
         pwd=secret.get('password',''); fp=hashlib.sha256(pwd.encode()).hexdigest() if pwd else None
         self.q('UPDATE vault_items SET title=?,url=?,username=?,encrypted_data=?,password_fingerprint=?,updated_at=? WHERE id=?',
                (title,public.get('url'),public.get('username'),enc_json(APP_DATA_KEY,secret),fp,now(),item_id))
-        owner=self.owner_id(self.item(item_id)); self.audit(uid,'ITEM_UPDATE',f'{title} | item:{item_id} | owner:{owner}')
+        owner=self.owner_id(old_it)
+        changes=[]
+        for label, old, newv in [
+            ('Nazwa wpisu', old_it['title'], title),
+            ('URL', old_it['url'] or '', public.get('url') or ''),
+            ('Login', old_it['username'] or '', public.get('username') or ''),
+        ]:
+            c=self.fmt_change(label, old, newv)
+            if c: changes.append(c)
+        for k,v in secret.items():
+            label={'password':'Hasło','note':'Notatka','content':'Treść notatki'}.get(k,k)
+            c=self.fmt_change(label, old_secret.get(k,''), v, hide=(k=='password'))
+            if c: changes.append(c)
+        if not changes:
+            changes.append('- Zapisano wpis bez zmiany wartości pól.')
+        actor=self.uname(uid); owner_name=self.uname(owner)
+        details=f'Aktor: {actor}. Wpis „{old_it["title"]}” (ID {item_id}), właściciel: {owner_name}.\n' + '\n'.join(changes) + f'\nitem:{item_id} owner:{owner} actor:{uid}'
+        self.audit(uid,'Zmieniono wpis',details)
     def delete_item(self, uid, item_id):
         it=self.item(item_id)
         if not it or self.owner_id(it)!=uid: raise ValueError('Tylko właściciel może usunąć wpis.')
         self.q('DELETE FROM share_grants WHERE item_id=?',(item_id,)); self.q('DELETE FROM vault_items WHERE id=?',(item_id,))
-        self.audit(uid,'ITEM_DELETE',it['title'])
+        self.audit(uid,'Usunięto wpis',f'Właściciel: {self.uname(uid)}. Usunięto wpis „{it["title"]}” (ID {item_id}). owner:{uid} item:{item_id}')
     def item(self, iid): return self.q('SELECT * FROM vault_items WHERE id=?',(iid,)).fetchone()
     def owner_id(self, item): return self.q('SELECT user_id FROM vaults WHERE id=?',(item['vault_id'],)).fetchone()[0]
     def can_read(self, uid, item_id):
@@ -165,11 +236,11 @@ class Store:
         if r['id']==uid: raise ValueError('Nie można udostępnić samemu sobie.')
         self.q('''INSERT INTO share_grants(item_id,owner_id,recipient_id,permission,created_at) VALUES(?,?,?,?,?)
                   ON CONFLICT(item_id,recipient_id) DO UPDATE SET permission=excluded.permission''',(item_id,uid,r['id'],perm,now()))
-        self.audit(uid,'SHARE_GRANT',f'{it["title"]} -> {recipient} ({perm}) | item:{item_id} | owner:{uid}')
+        self.audit(uid,'Zmieniono udostępnienie',f'Właściciel: {self.uname(uid)}. Wpis „{it["title"]}” (ID {item_id}) udostępniono użytkownikowi {recipient}. Uprawnienie: {perm}. owner:{uid} recipient:{r["id"]} item:{item_id}')
     def revoke(self, uid, item_id, recipient):
         r=self.user(recipient); it=self.item(item_id)
         if r and it and self.owner_id(it)==uid:
-            self.q('DELETE FROM share_grants WHERE item_id=? AND recipient_id=?',(item_id,r['id'])); self.audit(uid,'SHARE_REVOKE',f'{it["title"]} -> {recipient}')
+            self.q('DELETE FROM share_grants WHERE item_id=? AND recipient_id=?',(item_id,r['id'])); self.audit(uid,'Cofnięto udostępnienie',f'Właściciel: {self.uname(uid)}. Cofnięto dostęp użytkownikowi {recipient} do wpisu „{it["title"]}” (ID {item_id}). owner:{uid} recipient:{r["id"]} item:{item_id}')
     def audit_list(self, uid): return self.q('SELECT * FROM audit_events WHERE user_id=? ORDER BY created_at DESC LIMIT 200',(uid,)).fetchall()
     def export(self, uid, key, with_secrets=False):
         if with_secrets and not self.is_unlocked(uid): raise ValueError('Eksport sekretów wymaga odblokowanego sejfu.')
@@ -238,6 +309,83 @@ class App(tk.Tk):
         for w in self.winfo_children(): w.destroy()
     def make_button(self, parent, text, command, style='TButton'):
         return ttk.Button(parent,text=text,command=command,style=style)
+    def password_entry_with_toggle(self, parent, width=38, entry_style='TEntry'):
+        box = ttk.Frame(parent, style='Card.TFrame')
+        entry = ttk.Entry(box, show='*', width=width, style=entry_style)
+        entry.pack(side='left', fill='x', expand=True, ipady=4)
+        visible = tk.BooleanVar(value=False)
+        def toggle():
+            visible.set(not visible.get())
+            entry.config(show='' if visible.get() else '*')
+            btn.config(text='🙈' if visible.get() else '👁')
+        btn = ttk.Button(box, text='👁', width=3, command=toggle)
+        btn.pack(side='left', padx=(6,0))
+        return box, entry
+
+    def ask_modal_text(self, title, prompt, initialvalue='', show=None):
+        """Własne stabilne okno dialogowe: nie znika za główne okno i łapie fokus."""
+        result = {'value': None}
+        win = tk.Toplevel(self)
+        # Ukryj dialog na czas budowania i centrowania.
+        # Bez tego Windows/Tk potrafi najpierw pokazać go w lewym górnym rogu.
+        win.withdraw()
+        win.title(title)
+        win.configure(bg=self.BG)
+        win.transient(self)
+        win.resizable(False, False)
+        win.attributes('-topmost', True)
+
+        frm = ttk.Frame(win, style='Card.TFrame', padding=16)
+        frm.pack(fill='both', expand=True)
+        ttk.Label(frm, text=prompt, style='Card.TLabel', wraplength=360).pack(anchor='w', pady=(0, 8))
+        entry = ttk.Entry(frm, width=36, show=show or '')
+        entry.pack(fill='x', ipady=4)
+        entry.insert(0, initialvalue or '')
+        entry.select_range(0, 'end')
+
+        btns = ttk.Frame(frm, style='Card.TFrame')
+        btns.pack(fill='x', pady=(14, 0))
+
+        def ok():
+            result['value'] = entry.get()
+            win.destroy()
+
+        def cancel():
+            result['value'] = None
+            win.destroy()
+
+        ttk.Button(btns, text='OK', command=ok, style='Accent.TButton').pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(btns, text='Anuluj', command=cancel).pack(side='left', fill='x', expand=True, padx=(6, 0))
+        win.bind('<Return>', lambda e: ok())
+        win.bind('<Escape>', lambda e: cancel())
+
+        # Ustaw okno dialogowe dokładnie na środku głównego okna.
+        # update_idletasks() liczy prawdziwy rozmiar okna przed ustawieniem pozycji,
+        # inaczej Windows/Tk potrafi na chwilę pokazać dialog w lewym górnym rogu ekranu.
+        win.update_idletasks()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = max(self.winfo_width(), 1)
+        parent_h = max(self.winfo_height(), 1)
+        win_w = win.winfo_width()
+        win_h = win.winfo_height()
+        x = parent_x + (parent_w - win_w) // 2
+        y = parent_y + (parent_h - win_h) // 2
+
+        # Nie pozwól, aby dialog wyszedł poza ekran.
+        x = max(0, min(x, win.winfo_screenwidth() - win_w))
+        y = max(0, min(y, win.winfo_screenheight() - win_h))
+        win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+
+        # Dopiero teraz pokaż okno, już w poprawnym miejscu.
+        win.deiconify()
+        win.lift(self)
+        win.focus_force()
+        entry.focus_force()
+        win.grab_set()
+        self.wait_window(win)
+        return result['value']
+
     def login_screen(self):
         self.clear()
         root=ttk.Frame(self, style='TFrame', padding=28); root.pack(fill='both', expand=True)
@@ -256,16 +404,30 @@ class App(tk.Tk):
         u=ttk.Entry(card,width=38)
         def set_user(name):
             u.delete(0,'end'); u.insert(0,name); p.focus_set()
+        def delete_account(username):
+            pwd = self.ask_modal_text('Usuń konto', f'Podaj hasło konta „{username}”, które chcesz usunąć:', show='*')
+            if not pwd:
+                return
+            if not messagebox.askyesno('Ostateczne potwierdzenie', f'Czy na pewno chcesz usunąć konto „{username}”?\n\nTa operacja usunie też jego sejf i nie można jej cofnąć.'):
+                return
+            try:
+                self.s.delete_user(username, pwd)
+                messagebox.showinfo('OK', f'Konto „{username}” zostało usunięte.')
+                self.login_screen()
+            except Exception as e:
+                messagebox.showerror('Błąd', str(e))
         users=self.s.list_users()
         if users:
             for usr in users[:8]:
-                ttk.Button(users_bar, text=usr['username'], command=lambda n=usr['username']: set_user(n)).pack(side='left', padx=3, pady=2)
+                row=ttk.Frame(users_bar, style='Card.TFrame'); row.pack(fill='x', pady=2)
+                ttk.Button(row, text=usr['username'], command=lambda n=usr['username']: set_user(n)).pack(side='left', fill='x', expand=True, padx=(0,4))
+                ttk.Button(row, text='Usuń', command=lambda n=usr['username']: delete_account(n), style='Danger.TButton').pack(side='left')
         else:
             ttk.Label(users_bar, text='Brak kont — utwórz pierwsze konto.', style='Card.TLabel', foreground=self.MUTED).pack(anchor='w')
         ttk.Label(card,text='Login',style='Card.TLabel').pack(anchor='w')
         u.pack(fill='x',pady=(6,14),ipady=4)
         ttk.Label(card,text='Hasło główne',style='Card.TLabel').pack(anchor='w')
-        p=ttk.Entry(card,show='*',width=38); p.pack(fill='x',pady=(6,20),ipady=4)
+        p_box,p=self.password_entry_with_toggle(card, width=38); p_box.pack(fill='x',pady=(6,20))
         def do_login():
             try: self.user,self.key=self.s.login(u.get(),p.get()); self.main_screen()
             except Exception as e: messagebox.showerror('Błąd',str(e))
@@ -298,13 +460,11 @@ class App(tk.Tk):
         for c,t,w in [('type','Typ',95),('title','Nazwa',210),('login','Login',170),('url','URL',260),('perm','Dostęp',100)]:
             self.tree.heading(c,text=t); self.tree.column(c,width=w,anchor='w')
         self.tree.pack(fill='both',expand=True); self.tree.bind('<<TreeviewSelect>>',lambda e:self.show_selected())
+        self.tree.bind('<Double-1>', lambda e:self.open_edit())
         side=ttk.Frame(content, style='Card.TFrame', padding=16); side.grid(row=0,column=1,sticky='nsew')
         ttk.Label(side,text='Szybkie akcje',style='Card.TLabel',font=('Arial', 16, 'bold')).pack(anchor='w',pady=(0,12))
         for txt,cmd,sty in [('＋ Dodaj login',lambda:self.edit(LOGIN),'Accent.TButton'),('＋ Dodaj notatkę',lambda:self.edit(NOTE),'TButton'),('Podgląd / edycja',self.open_edit,'TButton'),('Udostępnij',self.share,'TButton'),('Cofnij udostępnienie',self.revoke,'TButton'),('Usuń wpis',self.delete,'Danger.TButton')]:
             self.make_button(side,txt,cmd,sty).pack(fill='x',pady=4)
-        ttk.Label(side,text='Udostępnienia właściciela',style='Card.TLabel',font=('Arial', 13, 'bold')).pack(anchor='w',pady=(16,6))
-        self.access_box=tk.Text(side,width=42,height=7,bg='#f9fafb',fg=self.TEXT,relief='flat',bd=0,padx=10,pady=8,wrap='word',font=('Consolas',9))
-        self.access_box.pack(fill='x')
         ttk.Label(side,text='Szczegóły wpisu',style='Card.TLabel',font=('Arial', 13, 'bold')).pack(anchor='w',pady=(18,8))
         self.details=tk.Text(side,width=42,height=20,bg='#f9fafb',fg=self.TEXT,insertbackground=self.TEXT,relief='flat',bd=0,padx=12,pady=12,wrap='word',font=('Consolas',10))
         self.details.pack(fill='both',expand=True)
@@ -333,9 +493,20 @@ class App(tk.Tk):
                 data=decrypt_secret(self.key,it['encrypted_data'])
                 for k,v in data.items(): self.details.insert('end',f'{k}: {v}\n')
             except Exception: self.details.insert('end','Sekret zaszyfrowany cudzym kluczem albo brak dostępu.\n')
-        else: self.details.insert('end','Sejf LOCKED — widoczne tylko metadane.\n')
+        else:
+            self.details.insert('end','Sejf LOCKED — widoczne tylko metadane.\n')
+
+        owner, shares = self.s.item_share_info(self.user['id'], iid)
+        self.details.insert('end','\nUdostępnienia właściciela:\n')
+        if owner:
+            self.details.insert('end',f'Właściciel: {owner}\n')
+        if shares:
+            for g in shares:
+                self.details.insert('end',f"- {g['recipient']} [{g['permission']}] od {iso(g['created_at'])}\n")
+        else:
+            self.details.insert('end','Brak aktywnych udostępnień dla tego wpisu.\n')
     def unlock(self):
-        p=simpledialog.askstring('Odblokuj sejf','Podaj hasło główne:',show='*')
+        p=self.ask_modal_text('Odblokuj sejf','Podaj hasło główne:',show='*')
         if p:
             try: self.s.unlock(self.user['id'],p); self.key=derive_key(p,self.user['kdf_salt']); self.refresh(); self.show_selected()
             except Exception as e: messagebox.showerror('Błąd',str(e))
@@ -353,7 +524,11 @@ class App(tk.Tk):
         entries={}
         for i,field in enumerate(fields):
             ttk.Label(frm,text=field,style='Card.TLabel').grid(row=i,column=0,sticky='e',padx=8,pady=6)
-            e=ttk.Entry(frm,width=45,show='*' if field=='password' else None); e.grid(row=i,column=1,pady=6,ipady=3)
+            if field == 'password':
+                pwd_box,e = self.password_entry_with_toggle(frm, width=45)
+                pwd_box.grid(row=i,column=1,pady=6,sticky='ew')
+            else:
+                e=ttk.Entry(frm,width=45); e.grid(row=i,column=1,pady=6,ipady=3,sticky='ew')
             e.insert(0, vals.get(field,data.get(field,''))); entries[field]=e
         def save():
             try:
@@ -377,11 +552,13 @@ class App(tk.Tk):
     def share(self):
         iid=self.current_id();
         if not iid: return
-        rec=simpledialog.askstring('Udostępnij','Login odbiorcy:'); perm=simpledialog.askstring('Uprawnienie','READ albo UPDATE:',initialvalue='READ')
+        rec=self.ask_modal_text('Udostępnij','Login odbiorcy:')
+        if not rec: return
+        perm=self.ask_modal_text('Uprawnienie','READ albo UPDATE:',initialvalue='READ')
         try: self.s.share(self.user['id'],iid,rec,(perm or READ).upper()); self.refresh()
         except Exception as e: messagebox.showerror('Błąd',str(e))
     def revoke(self):
-        iid=self.current_id(); rec=simpledialog.askstring('Cofnij','Login odbiorcy:')
+        iid=self.current_id(); rec=self.ask_modal_text('Cofnij','Login odbiorcy:')
         if iid and rec: self.s.revoke(self.user['id'],iid,rec); self.refresh()
     def generator(self):
         win=tk.Toplevel(self); win.title('Generator haseł'); win.configure(bg=self.BG); frm=ttk.Frame(win,style='Card.TFrame',padding=20); frm.pack(fill='both',expand=True,padx=12,pady=12)
@@ -408,12 +585,18 @@ class App(tk.Tk):
         score=max(0,100-dup*20-short*10)
         messagebox.showinfo('Password Health',f'Powtórzone hasła: {dup}\nHasła krótsze niż 12 znaków: {short}\nOcena sejfu: {score}/100\nAnaliza używa fingerprintów i długości, bez zapisywania haseł jawnie w bazie.')
     def audit(self):
-        text='\n'.join(f"{iso(r['created_at'])} | {r['username'] or 'system'} | {r['event_type']} | {r['details']}" for r in self.s.audit_all(self.user['id']))
+        labels={'ITEM_UPDATE':'Zmieniono wpis','ITEM_CREATE':'Utworzono wpis','ITEM_DELETE':'Usunięto wpis','SHARE_GRANT':'Zmieniono udostępnienie','SHARE_REVOKE':'Cofnięto udostępnienie','LOGIN':'Logowanie','LOGOUT':'Wylogowanie','REGISTER':'Rejestracja','VAULT_UNLOCK':'Odblokowanie sejfu','VAULT_LOCK':'Zablokowanie sejfu','AUTO_LOCK':'Automatyczna blokada','EXPORT':'Eksport'}
+        lines=[]
+        for r in self.s.audit_all(self.user['id']):
+            typ=labels.get(r['event_type'], r['event_type'])
+            details=re.sub(r'\s*(item|owner|recipient|actor):\d+', '', r['details'] or '').strip()
+            lines.append(f"{iso(r['created_at'])} | {r['username'] or 'system'} | {typ}\n{details}\n")
+        text='\n'.join(lines)
         win=tk.Toplevel(self); win.title('Audyt zdarzeń'); win.configure(bg=self.BG); t=tk.Text(win,width=110,height=34,bg='#f9fafb',fg=self.TEXT,insertbackground=self.TEXT,relief='flat',padx=14,pady=14,font=('Consolas',10)); t.pack(fill='both',expand=True,padx=12,pady=12); t.insert('end',text)
     def export(self):
         with_sec=messagebox.askyesno('Eksport','Eksportować także sekrety? Wymaga odblokowanego sejfu.')
         if with_sec:
-            p=simpledialog.askstring('Potwierdzenie','Ponownie podaj hasło główne:',show='*')
+            p=self.ask_modal_text('Potwierdzenie','Ponownie podaj hasło główne:',show='*')
             if not p or not verify_password(p,self.user['password_salt'],self.user['password_hash']): return messagebox.showerror('Błąd','Niepoprawne hasło.')
         try: rows=self.s.export(self.user['id'],self.key,with_sec)
         except Exception as e: return messagebox.showerror('Błąd',str(e))
