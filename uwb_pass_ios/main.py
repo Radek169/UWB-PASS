@@ -6,6 +6,8 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 DB = Path(__file__).with_name('uwb_pass.db')
+LOGO = Path(__file__).with_name('uwb_logo.png')
+APP_DATA_KEY = hashlib.sha256(b'UWB-Pass local shared data key v2').digest()
 LOCK_AFTER = 300
 PBKDF_ITERS = 390_000
 
@@ -40,6 +42,16 @@ def dec_json(key, blob):
     raw = ub64(blob); nonce, ct = raw[:12], raw[12:]
     return json.loads(AESGCM(key).decrypt(nonce, ct, None).decode())
 
+def decrypt_secret(user_key, blob):
+    # Nowe wpisy są szyfrowane wspólnym kluczem aplikacji, aby działały READ/UPDATE dla udostępnień.
+    # Starsze wpisy pozostają kompatybilne z kluczem użytkownika.
+    for k in (APP_DATA_KEY, user_key):
+        try:
+            return dec_json(k, blob)
+        except Exception:
+            pass
+    raise ValueError('Nie można odszyfrować danych.')
+
 class Store:
     def __init__(self, path=DB):
         self.conn = sqlite3.connect(path)
@@ -72,6 +84,16 @@ class Store:
         return self.q('SELECT * FROM users WHERE username=?',(username,)).fetchone()
     def user_by_id(self, uid):
         return self.q('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+    def list_users(self):
+        return self.q('SELECT id, username, created_at FROM users ORDER BY username').fetchall()
+    def share_list(self, uid):
+        return self.q('''SELECT g.*, i.title, i.url, i.username AS item_username, u.username AS recipient
+                         FROM share_grants g JOIN vault_items i ON i.id=g.item_id
+                         JOIN users u ON u.id=g.recipient_id
+                         WHERE g.owner_id=? ORDER BY g.created_at DESC''',(uid,)).fetchall()
+    def audit_all(self, uid):
+        return self.q('''SELECT a.*, u.username FROM audit_events a LEFT JOIN users u ON u.id=a.user_id
+                         WHERE a.user_id=? OR a.details LIKE ? ORDER BY a.created_at DESC LIMIT 250''',(uid, f'%owner:{uid}%')).fetchall()
     def register(self, username, password):
         if not username or len(password) < 8: raise ValueError('Login wymagany, hasło min. 8 znaków.')
         ps, ph = hash_password(password); ks = b64(secrets.token_bytes(16))
@@ -105,15 +127,15 @@ class Store:
         vault_id=self.vault(uid)['id']; pwd=secret.get('password','')
         fp=hashlib.sha256(pwd.encode()).hexdigest() if pwd else None
         self.q('''INSERT INTO vault_items(vault_id,type,title,url,username,encrypted_data,password_fingerprint,created_at,updated_at)
-                  VALUES(?,?,?,?,?,?,?,?,?)''',(vault_id,typ,title,public.get('url'),public.get('username'),enc_json(key,secret),fp,now(),now()))
-        self.audit(uid,'ITEM_CREATE',title)
+                  VALUES(?,?,?,?,?,?,?,?,?)''',(vault_id,typ,title,public.get('url'),public.get('username'),enc_json(APP_DATA_KEY,secret),fp,now(),now()))
+        self.audit(uid,'ITEM_CREATE',f'{title} | owner:{uid}')
     def update_item(self, uid, key, item_id, title, public, secret):
         if not self.can_edit(uid,item_id): raise ValueError('Brak uprawnień do edycji.')
         if not self.is_unlocked(uid): raise ValueError('Sejf jest zablokowany.')
         pwd=secret.get('password',''); fp=hashlib.sha256(pwd.encode()).hexdigest() if pwd else None
         self.q('UPDATE vault_items SET title=?,url=?,username=?,encrypted_data=?,password_fingerprint=?,updated_at=? WHERE id=?',
-               (title,public.get('url'),public.get('username'),enc_json(key,secret),fp,now(),item_id))
-        self.audit(uid,'ITEM_UPDATE',title)
+               (title,public.get('url'),public.get('username'),enc_json(APP_DATA_KEY,secret),fp,now(),item_id))
+        owner=self.owner_id(self.item(item_id)); self.audit(uid,'ITEM_UPDATE',f'{title} | item:{item_id} | owner:{owner}')
     def delete_item(self, uid, item_id):
         it=self.item(item_id)
         if not it or self.owner_id(it)!=uid: raise ValueError('Tylko właściciel może usunąć wpis.')
@@ -135,13 +157,15 @@ class Store:
         return list(own)+list(shared)
     def share(self, uid, item_id, recipient, perm):
         it=self.item(item_id)
+        perm=(perm or READ).upper()
+        if perm not in (READ, UPDATE): raise ValueError('Uprawnienie musi być READ albo UPDATE.')
         if not it or self.owner_id(it)!=uid: raise ValueError('Tylko właściciel może udostępnić wpis.')
         r=self.user(recipient)
         if not r: raise ValueError('Odbiorca nie istnieje.')
         if r['id']==uid: raise ValueError('Nie można udostępnić samemu sobie.')
         self.q('''INSERT INTO share_grants(item_id,owner_id,recipient_id,permission,created_at) VALUES(?,?,?,?,?)
                   ON CONFLICT(item_id,recipient_id) DO UPDATE SET permission=excluded.permission''',(item_id,uid,r['id'],perm,now()))
-        self.audit(uid,'SHARE_GRANT',f'{it["title"]} -> {recipient} ({perm})')
+        self.audit(uid,'SHARE_GRANT',f'{it["title"]} -> {recipient} ({perm}) | item:{item_id} | owner:{uid}')
     def revoke(self, uid, item_id, recipient):
         r=self.user(recipient); it=self.item(item_id)
         if r and it and self.owner_id(it)==uid:
@@ -152,7 +176,7 @@ class Store:
         rows=[]
         for it in self.list_items(uid):
             row=dict(id=it['id'],type=it['type'],title=it['title'],url=it['url'] or '',username=it['username'] or '',permission=it['permission'])
-            if with_secrets: row.update(dec_json(key,it['encrypted_data']))
+            if with_secrets: row.update(decrypt_secret(key,it['encrypted_data']))
             rows.append(row)
         self.audit(uid,'EXPORT','Eksport danych z sekretami' if with_secrets else 'Eksport metadanych')
         return rows
@@ -166,7 +190,7 @@ class App(tk.Tk):
         self.geometry('1220x780')
         self.minsize(1050,680)
         self.configure(bg=self.BG)
-        self.s=Store(); self.user=None; self.key=None; self.selected=None
+        self.s=Store(); self.user=None; self.key=None; self.selected=None; self.logo_img=None; self.logo_images=[]
         self.setup_style()
         self.login_screen()
     def setup_style(self):
@@ -200,6 +224,16 @@ class App(tk.Tk):
         self.style.configure('Treeview.Heading', background='#f2f2f7', foreground='#3a3a3c', borderwidth=0, font=('Arial', 10, 'bold'), padding=9)
         self.style.map('Treeview', background=[('selected', '#dbeafe')], foreground=[('selected','#1c1c1e')])
         self.style.configure('TCheckbutton', background=self.CARD, foreground=self.TEXT, focuscolor=self.CARD, font=('Arial', 10))
+
+    def logo(self, parent, bg_style='Card.TLabel', small=False):
+        if LOGO.exists():
+            try:
+                img=tk.PhotoImage(file=str(LOGO))
+                self.logo_images.append(img)
+                return ttk.Label(parent, image=img, style=bg_style)
+            except Exception:
+                pass
+        return ttk.Label(parent, text='Filia UWB w Wilnie', style=bg_style, font=('Arial', 14 if small else 18, 'bold'))
     def clear(self):
         for w in self.winfo_children(): w.destroy()
     def make_button(self, parent, text, command, style='TButton'):
@@ -210,14 +244,26 @@ class App(tk.Tk):
         hero=ttk.Frame(root, style='Panel.TFrame', padding=36); hero.pack(fill='both', expand=True)
         hero.columnconfigure(0, weight=1); hero.columnconfigure(1, weight=1)
         left=ttk.Frame(hero, style='Panel.TFrame'); left.grid(row=0,column=0,sticky='nsew',padx=(0,28))
-        ttk.Label(left, text='UWB-Pass', style='Hero.TLabel').pack(anchor='w', pady=(92,10))
+        self.logo(left, 'Panel.TLabel').pack(anchor='w', pady=(24,24))
+        ttk.Label(left, text='UWB-Pass', style='Hero.TLabel').pack(anchor='w', pady=(16,10))
         ttk.Label(left, text='Prosty, bezpieczny i elegancki menedżer haseł.', style='Sub.TLabel', wraplength=430, font=('Arial', 15)).pack(anchor='w', pady=(0,12))
         ttk.Label(left, text='Minimalistyczny sejf prywatnych danych z czytelnym panelem, generatorem haseł i historią audytu.', style='Sub.TLabel', wraplength=430).pack(anchor='w')
         card=ttk.Frame(hero, style='Card.TFrame', padding=28); card.grid(row=0,column=1,sticky='nsew')
         ttk.Label(card,text='Logowanie do sejfu',style='Card.TLabel',font=('Arial', 20, 'bold')).pack(anchor='w')
         ttk.Label(card,text='Podaj dane albo utwórz nowe konto demo.',style='Card.TLabel',foreground=self.MUTED).pack(anchor='w',pady=(4,24))
+        ttk.Label(card,text='Wybierz użytkownika',style='Card.TLabel').pack(anchor='w')
+        users_bar=ttk.Frame(card, style='Card.TFrame'); users_bar.pack(fill='x', pady=(6,10))
+        u=ttk.Entry(card,width=38)
+        def set_user(name):
+            u.delete(0,'end'); u.insert(0,name); p.focus_set()
+        users=self.s.list_users()
+        if users:
+            for usr in users[:8]:
+                ttk.Button(users_bar, text=usr['username'], command=lambda n=usr['username']: set_user(n)).pack(side='left', padx=3, pady=2)
+        else:
+            ttk.Label(users_bar, text='Brak kont — utwórz pierwsze konto.', style='Card.TLabel', foreground=self.MUTED).pack(anchor='w')
         ttk.Label(card,text='Login',style='Card.TLabel').pack(anchor='w')
-        u=ttk.Entry(card,width=38); u.pack(fill='x',pady=(6,14),ipady=4)
+        u.pack(fill='x',pady=(6,14),ipady=4)
         ttk.Label(card,text='Hasło główne',style='Card.TLabel').pack(anchor='w')
         p=ttk.Entry(card,show='*',width=38); p.pack(fill='x',pady=(6,20),ipady=4)
         def do_login():
@@ -236,6 +282,7 @@ class App(tk.Tk):
         header=ttk.Frame(shell, style='Panel.TFrame', padding=(20,16)); header.pack(fill='x', pady=(0,14))
         header.columnconfigure(0, weight=1)
         hleft=ttk.Frame(header, style='Panel.TFrame'); hleft.grid(row=0,column=0,sticky='w')
+        self.logo(hleft, 'Panel.TLabel', small=True).pack(anchor='w', pady=(0,6))
         ttk.Label(hleft,text='UWB-Pass Vault',style='Panel.TLabel',font=('Arial', 20, 'bold')).pack(anchor='w')
         self.status=ttk.Label(hleft,text='',style='Sub.TLabel'); self.status.pack(anchor='w',pady=(4,0))
         actions=ttk.Frame(header, style='Panel.TFrame'); actions.grid(row=0,column=1,sticky='e')
@@ -247,14 +294,17 @@ class App(tk.Tk):
         topbar=ttk.Frame(list_card, style='Card.TFrame'); topbar.pack(fill='x',pady=(0,12))
         ttk.Label(topbar,text='Wpisy w sejfie',style='Card.TLabel',font=('Arial', 16, 'bold')).pack(side='left')
         ttk.Label(topbar,text='  metadane widoczne także przy LOCKED',style='Card.TLabel',foreground=self.MUTED).pack(side='left')
-        self.tree=ttk.Treeview(list_card,columns=('type','title','user','perm'),show='headings',height=22)
-        for c,t,w in [('type','Typ',100),('title','Nazwa',260),('user','Login / URL',320),('perm','Dostęp',110)]:
+        self.tree=ttk.Treeview(list_card,columns=('type','title','login','url','perm'),show='headings',height=22)
+        for c,t,w in [('type','Typ',95),('title','Nazwa',210),('login','Login',170),('url','URL',260),('perm','Dostęp',100)]:
             self.tree.heading(c,text=t); self.tree.column(c,width=w,anchor='w')
         self.tree.pack(fill='both',expand=True); self.tree.bind('<<TreeviewSelect>>',lambda e:self.show_selected())
         side=ttk.Frame(content, style='Card.TFrame', padding=16); side.grid(row=0,column=1,sticky='nsew')
         ttk.Label(side,text='Szybkie akcje',style='Card.TLabel',font=('Arial', 16, 'bold')).pack(anchor='w',pady=(0,12))
         for txt,cmd,sty in [('＋ Dodaj login',lambda:self.edit(LOGIN),'Accent.TButton'),('＋ Dodaj notatkę',lambda:self.edit(NOTE),'TButton'),('Podgląd / edycja',self.open_edit,'TButton'),('Udostępnij',self.share,'TButton'),('Cofnij udostępnienie',self.revoke,'TButton'),('Usuń wpis',self.delete,'Danger.TButton')]:
             self.make_button(side,txt,cmd,sty).pack(fill='x',pady=4)
+        ttk.Label(side,text='Udostępnienia właściciela',style='Card.TLabel',font=('Arial', 13, 'bold')).pack(anchor='w',pady=(16,6))
+        self.access_box=tk.Text(side,width=42,height=7,bg='#f9fafb',fg=self.TEXT,relief='flat',bd=0,padx=10,pady=8,wrap='word',font=('Consolas',9))
+        self.access_box.pack(fill='x')
         ttk.Label(side,text='Szczegóły wpisu',style='Card.TLabel',font=('Arial', 13, 'bold')).pack(anchor='w',pady=(18,8))
         self.details=tk.Text(side,width=42,height=20,bg='#f9fafb',fg=self.TEXT,insertbackground=self.TEXT,relief='flat',bd=0,padx=12,pady=12,wrap='word',font=('Consolas',10))
         self.details.pack(fill='both',expand=True)
@@ -265,7 +315,13 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         for it in self.s.list_items(self.user['id']):
             icon='🔐' if it['type']==LOGIN else '📝'
-            self.tree.insert('', 'end', iid=str(it['id']), values=(icon+' '+it['type'],it['title'],(it['username'] or it['url'] or ''),it['permission']))
+            self.tree.insert('', 'end', iid=str(it['id']), values=(icon+' '+it['type'],it['title'],it['username'] or '',it['url'] or '',it['permission']))
+        if hasattr(self,'access_box'):
+            self.access_box.delete('1.0','end')
+            shares=self.s.share_list(self.user['id'])
+            if not shares: self.access_box.insert('end','Brak aktywnych udostępnień.\n')
+            for g in shares:
+                self.access_box.insert('end',f"{g['title']} -> {g['recipient']} [{g['permission']}] {iso(g['created_at'])}\n")
     def current_id(self):
         sel=self.tree.selection(); return int(sel[0]) if sel else None
     def show_selected(self):
@@ -274,7 +330,7 @@ class App(tk.Tk):
         it=self.s.item(iid); self.details.insert('end',f"ID: {it['id']}\nTyp: {it['type']}\nNazwa: {it['title']}\nURL: {it['url'] or ''}\nLogin: {it['username'] or ''}\nUtworzono: {iso(it['created_at'])}\nZmodyfikowano: {iso(it['updated_at'])}\n\n")
         if self.s.is_unlocked(self.user['id']) and self.s.can_read(self.user['id'],iid):
             try:
-                data=dec_json(self.key,it['encrypted_data'])
+                data=decrypt_secret(self.key,it['encrypted_data'])
                 for k,v in data.items(): self.details.insert('end',f'{k}: {v}\n')
             except Exception: self.details.insert('end','Sekret zaszyfrowany cudzym kluczem albo brak dostępu.\n')
         else: self.details.insert('end','Sejf LOCKED — widoczne tylko metadane.\n')
@@ -291,7 +347,7 @@ class App(tk.Tk):
         vals={}; data={}
         if item:
             vals=dict(title=item['title'],url=item['url'] or '',username=item['username'] or '')
-            try: data=dec_json(self.key,item['encrypted_data'])
+            try: data=decrypt_secret(self.key,item['encrypted_data'])
             except Exception: data={}
         fields=['title'] + (['url','username','password','note'] if typ==LOGIN else ['content'])
         entries={}
@@ -347,12 +403,12 @@ class App(tk.Tk):
         dup=sum(1 for x in set(fps) if fps.count(x)>1); short=0; total=0
         for i in items:
             try:
-                d=dec_json(self.key,i['encrypted_data']); p=d.get('password',''); total+=1 if p else 0; short+=1 if p and len(p)<12 else 0
+                d=decrypt_secret(self.key,i['encrypted_data']); p=d.get('password',''); total+=1 if p else 0; short+=1 if p and len(p)<12 else 0
             except Exception: pass
         score=max(0,100-dup*20-short*10)
         messagebox.showinfo('Password Health',f'Powtórzone hasła: {dup}\nHasła krótsze niż 12 znaków: {short}\nOcena sejfu: {score}/100\nAnaliza używa fingerprintów i długości, bez zapisywania haseł jawnie w bazie.')
     def audit(self):
-        text='\n'.join(f"{iso(r['created_at'])} | {r['event_type']} | {r['details']}" for r in self.s.audit_list(self.user['id']))
+        text='\n'.join(f"{iso(r['created_at'])} | {r['username'] or 'system'} | {r['event_type']} | {r['details']}" for r in self.s.audit_all(self.user['id']))
         win=tk.Toplevel(self); win.title('Audyt zdarzeń'); win.configure(bg=self.BG); t=tk.Text(win,width=110,height=34,bg='#f9fafb',fg=self.TEXT,insertbackground=self.TEXT,relief='flat',padx=14,pady=14,font=('Consolas',10)); t.pack(fill='both',expand=True,padx=12,pady=12); t.insert('end',text)
     def export(self):
         with_sec=messagebox.askyesno('Eksport','Eksportować także sekrety? Wymaga odblokowanego sejfu.')
