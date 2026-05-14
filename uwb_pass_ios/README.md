@@ -19,4 +19,4 @@ py main.py
 - generator haseł,
 - audyt zdarzeń,
 - eksport CSV,
-- jasny interfejs premium w stylu dzisiejszym.
+- jasny interfejs premium w stylu iOS.
